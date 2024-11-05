@@ -28,6 +28,7 @@ import torch.nn as nn
 from collections import OrderedDict
 from torchvision import transforms
 import math
+import gc
 
 INPUT_PATH = Path("/input")
 OUTPUT_PATH = Path("/output")
@@ -129,13 +130,7 @@ def get_metainfo(itk_image):
     original_pixelid = itk_image.GetPixelIDValue()
     return {'spacing': original_spacing, 'size':original_size, 
             'origin': original_origin, 'direction':original_direction, 'pixelid':original_pixelid}
-class BaseNet(nn.Module):
-    def __init__(self,):
-        super().__init__()
 
-    def forward(self,x):
-        out=torch.where(x<-2,1,0)
-        return out
 def pooling3x3x3(kernel_size=2, stride=2) -> nn.MaxPool3d:
     """3x3x3 pooling"""
     return nn.MaxPool3d(kernel_size=kernel_size)
@@ -248,6 +243,15 @@ class UNet3D(nn.Module):
                 ]
             )
         )
+def get_images():
+    image_paths = []
+    input_skull_stripped_adc = glob(str(INPUT_PATH / "images/skull-stripped-adc-brain-mri" / "*.mha"))
+    z_adc = glob(str(INPUT_PATH / "images/z-score-adc" / "*.mha"))
+    for adc, z in zip (input_skull_stripped_adc, z_adc):
+        tmp = z.split(os.sep)[-1]
+        name = tmp.split('.')[0]
+        image_paths.append([adc, z, name])
+    return image_paths
 def run():
     # load pre trained parameters
     state_dict = torch.load(f'unet_11-03-19-51.pt', map_location=get_default_device())
@@ -255,43 +259,41 @@ def run():
     train_transform = transform()
     # Read the input
 
-    input_skull_stripped_adc, _ = load_image_file_as_array(
-        location=INPUT_PATH / "images/skull-stripped-adc-brain-mri",
-    )
-    z_adc, info = load_image_file_as_array(
-        location=INPUT_PATH / "images/z-score-adc",
-    )
-    metainfo = get_metainfo(info)
-    zadcb = np.where(z_adc<-2, 1, 0)
+    image_paths = get_images()
+    for adc, z, name in image_paths:
+        input_skull_stripped_adc, _ = load_image_file_as_array(adc)
+        z_adc, info = load_image_file_as_array(z)
+        metainfo = get_metainfo(info)
+        zadcb = np.where(z_adc<-2, 1, 0)
+        images = train_transform({"q": z_adc, "k":zadcb, "v": input_skull_stripped_adc})
+        img = stack_data(images) 
+        # Process the inputs: any way you'd like
+        _show_torch_cuda_info()
 
-    images = train_transform({"q": z_adc, "k":zadcb, "v": input_skull_stripped_adc})
-    img = stack_data(images) 
-    # Process the inputs: any way you'd like
-    _show_torch_cuda_info()
+        with torch.no_grad():
+            znadcnth_input=img[None,...].to(get_default_device())
 
-    with torch.no_grad():
-       znadcnth_input=img[None,...].to(get_default_device())
+            net=UNet3D(in_channels=3, out_channels=1)
+            net.load_state_dict(state_dict)
+            net.eval()
+            net=net.to(get_default_device())   
 
-       net=UNet3D(in_channels=3, out_channels=1)
-       net.load_state_dict(state_dict)
-       net.eval()
-       net=net.to(get_default_device())   
+            out=net(znadcnth_input)
 
-       out=net(znadcnth_input)
+            out=out.detach().cpu().numpy().squeeze(0).squeeze(0)
+            out = np.where(out>0.90, 1, 0).astype(np.uint8)
+            out = origin_crop(out, metainfo['size'])
 
-       out=out.detach().cpu().numpy().squeeze(0).squeeze(0)
-       out = np.where(out>0.95, 1, 0).astype(np.uint8)
-       out = origin_crop(out, metainfo['size'])
+            print ("check out",np.sum(out))
+            
 
-       print ("check out",np.sum(out))
-        
-
-    hie_segmentation=SimpleITK.GetImageFromArray(out)    
+        hie_segmentation=SimpleITK.GetImageFromArray(out)    
 
 
-    # For now, let us save predictions
-    save_image(hie_segmentation)
-    
+        # For now, let us save predictions
+        save_image(hie_segmentation, name)
+        del out, znadcnth_input, img, images, input_skull_stripped_adc, z_adc, zadcb
+        gc.collect()
     return 0
 
 
@@ -302,14 +304,13 @@ def write_json_file(*, location, content):
 
 
 
-def save_image(pred_lesion):
+def save_image(pred_lesion, name):
     relative_path="images/hie-lesion-segmentation"
     output_directory = OUTPUT_PATH / relative_path
 
     output_directory.mkdir(exist_ok=True, parents=True)
 
-    file_save_name=output_directory / "overlay.mha"
-    print (file_save_name)
+    file_save_name=output_directory / f"{name}.mha"
 
     SimpleITK.WriteImage(pred_lesion, file_save_name)
     check_file = os.path.isfile(file_save_name)
@@ -317,10 +318,9 @@ def save_image(pred_lesion):
 
 
 
-def load_image_file_as_array(*, location):
+def load_image_file_as_array(location):
     # Use SimpleITK to read a file
-    input_files = glob(str(location / "*.mha"))
-    result = SimpleITK.ReadImage(input_files[0])
+    result = SimpleITK.ReadImage(location)
 
     # Convert it to a Numpy array
     return SimpleITK.GetArrayFromImage(result), result
